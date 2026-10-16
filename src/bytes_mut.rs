@@ -101,10 +101,10 @@ const KIND_MASK: usize = 0b1;
 
 // The max original capacity value. Any `Bytes` allocated with a greater initial
 // capacity will default to this.
-const MAX_ORIGINAL_CAPACITY_WIDTH: usize = 17;
+pub(crate) const MAX_ORIGINAL_CAPACITY_WIDTH: usize = 17;
 // The original capacity algorithm will not take effect unless the originally
 // allocated capacity was at least 1kb in size.
-const MIN_ORIGINAL_CAPACITY_WIDTH: usize = 10;
+pub(crate) const MIN_ORIGINAL_CAPACITY_WIDTH: usize = 10;
 // The original capacity is stored in powers of 2 starting at 1kb to a max of
 // 64kb. Representing it as such requires only 3 bits of storage.
 const ORIGINAL_CAPACITY_MASK: usize = 0b11100;
@@ -1589,7 +1589,7 @@ impl Shared {
 }
 
 #[inline]
-fn original_capacity_to_repr(cap: usize) -> usize {
+pub(crate) fn original_capacity_to_repr(cap: usize) -> usize {
     let width = PTR_WIDTH - ((cap >> MIN_ORIGINAL_CAPACITY_WIDTH).leading_zeros() as usize);
     cmp::min(
         width,
@@ -1597,66 +1597,12 @@ fn original_capacity_to_repr(cap: usize) -> usize {
     )
 }
 
-fn original_capacity_from_repr(repr: usize) -> usize {
+pub(crate) fn original_capacity_from_repr(repr: usize) -> usize {
     if repr == 0 {
         return 0;
     }
 
     1 << (repr + (MIN_ORIGINAL_CAPACITY_WIDTH - 1))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_original_capacity_to_repr() {
-        assert_eq!(original_capacity_to_repr(0), 0);
-
-        let max_width = 32;
-
-        for width in 1..(max_width + 1) {
-            let cap = 1 << width - 1;
-
-            let expected = if width < MIN_ORIGINAL_CAPACITY_WIDTH {
-                0
-            } else if width < MAX_ORIGINAL_CAPACITY_WIDTH {
-                width - MIN_ORIGINAL_CAPACITY_WIDTH
-            } else {
-                MAX_ORIGINAL_CAPACITY_WIDTH - MIN_ORIGINAL_CAPACITY_WIDTH
-            };
-
-            assert_eq!(original_capacity_to_repr(cap), expected);
-
-            if width > 1 {
-                assert_eq!(original_capacity_to_repr(cap + 1), expected);
-            }
-
-            //  MIN_ORIGINAL_CAPACITY_WIDTH must be bigger than 7 to pass tests below
-            if width == MIN_ORIGINAL_CAPACITY_WIDTH + 1 {
-                assert_eq!(original_capacity_to_repr(cap - 24), expected - 1);
-                assert_eq!(original_capacity_to_repr(cap + 76), expected);
-            } else if width == MIN_ORIGINAL_CAPACITY_WIDTH + 2 {
-                assert_eq!(original_capacity_to_repr(cap - 1), expected - 1);
-                assert_eq!(original_capacity_to_repr(cap - 48), expected - 1);
-            }
-        }
-    }
-
-    #[test]
-    fn test_original_capacity_from_repr() {
-        assert_eq!(0, original_capacity_from_repr(0));
-
-        let min_cap = 1 << MIN_ORIGINAL_CAPACITY_WIDTH;
-
-        assert_eq!(min_cap, original_capacity_from_repr(1));
-        assert_eq!(min_cap * 2, original_capacity_from_repr(2));
-        assert_eq!(min_cap * 4, original_capacity_from_repr(3));
-        assert_eq!(min_cap * 8, original_capacity_from_repr(4));
-        assert_eq!(min_cap * 16, original_capacity_from_repr(5));
-        assert_eq!(min_cap * 32, original_capacity_from_repr(6));
-        assert_eq!(min_cap * 64, original_capacity_from_repr(7));
-    }
 }
 
 unsafe impl Send for BytesMut {}
@@ -1994,36 +1940,3 @@ fn _split_off_must_use() {}
 fn _split_must_use() {}
 
 // fuzz tests
-#[cfg(all(test, loom))]
-mod fuzz {
-    use loom::sync::Arc;
-    use loom::thread;
-
-    use super::BytesMut;
-    use crate::Bytes;
-
-    #[test]
-    fn bytes_mut_cloning_frozen() {
-        loom::model(|| {
-            let a = BytesMut::from(&b"abcdefgh"[..]).split().freeze();
-            let addr = a.as_ptr() as usize;
-
-            // test the Bytes::clone is Sync by putting it in an Arc
-            let a1 = Arc::new(a);
-            let a2 = a1.clone();
-
-            let t1 = thread::spawn(move || {
-                let b: Bytes = (*a1).clone();
-                assert_eq!(b.as_ptr() as usize, addr);
-            });
-
-            let t2 = thread::spawn(move || {
-                let b: Bytes = (*a2).clone();
-                assert_eq!(b.as_ptr() as usize, addr);
-            });
-
-            t1.join().unwrap();
-            t2.join().unwrap();
-        });
-    }
-}

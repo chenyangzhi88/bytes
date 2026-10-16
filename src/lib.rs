@@ -217,3 +217,6 @@ fn panic_does_not_fit(size: usize, nbytes: usize) -> ! {
         size, nbytes
     );
 }
+
+#[cfg(test)]
+mod tests;

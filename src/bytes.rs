@@ -289,6 +289,67 @@ impl Bytes {
         ret
     }
 
+    /// Creates an owned buffer whose release callback runs after both the owner
+    /// and its allocation have been destroyed.
+    ///
+    /// The owner is pinned in its allocation before `AsRef` is called exactly
+    /// once. Clones and nonempty slices share the same release callback. The
+    /// callback also runs if that `AsRef` call or the owner's destructor panics.
+    /// Conversions into `Vec` or `BytesMut` copy the visible bytes, as for
+    /// [`Bytes::from_owner`].
+    pub fn from_owner_with_release<T, F>(owner: T, release: F) -> Self
+    where
+        T: AsRef<[u8]> + Send + 'static,
+        F: FnOnce() + Send + 'static,
+    {
+        let mut retirement = RetirementGuard(Some(release));
+        let (mut ret, owned) = {
+            // Plain owner and uninitialized allocation unwind before retirement.
+            // Atomic construction can panic under a model checker, so finish it
+            // before transferring either owner into ManuallyDrop storage.
+            let owner = owner;
+            let ref_cnt = AtomicUsize::new(1);
+            let mut allocation = Box::new(MaybeUninit::<OwnedReleased<T, F>>::uninit());
+            let owned = allocation.as_mut_ptr();
+            let data = AtomicPtr::new(owned.cast());
+            let release = retirement.0.take().unwrap();
+            // SAFETY: the allocation has the exact layout of OwnedReleased. No
+            // fallible or user operation separates this write from binding ret.
+            unsafe {
+                owned.write(OwnedReleased {
+                    ref_cnt,
+                    owner: ManuallyDrop::new(owner),
+                    release: ManuallyDrop::new(release),
+                });
+            }
+            let _allocation = Box::into_raw(allocation);
+            let ret = Bytes {
+                ptr: NonNull::dangling().as_ptr(),
+                len: 0,
+                data,
+                vtable: &OwnedReleased::<T, F>::VTABLE,
+            };
+            (ret, owned)
+        };
+        // SAFETY: ret already owns the initialized allocation and its cleanup
+        // token. T will never move again, including while its destructor runs.
+        let buf = unsafe { &*owned }.owner.as_ref();
+        ret.ptr = buf.as_ptr();
+        ret.len = buf.len();
+        ret
+    }
+
+    /// The exact allocation layout used by [`Bytes::from_owner_with_release`].
+    /// This includes its reference count, both stored values and padding. It
+    /// does not allocate or invoke either value.
+    pub fn from_owner_with_release_allocation_layout<T, F>() -> Layout
+    where
+        T: AsRef<[u8]> + Send + 'static,
+        F: FnOnce() + Send + 'static,
+    {
+        Layout::new::<OwnedReleased<T, F>>()
+    }
+
     /// Returns the number of bytes contained in this `Bytes`.
     ///
     /// # Examples
@@ -1163,6 +1224,98 @@ unsafe fn owned_drop<T>(data: *mut (), _ptr: *const u8, _len: usize) {
     owned_drop_impl::<T>(data);
 }
 
+// The callback is deliberately outside the allocation being retired. Moving F
+// is safe: unlike T, it is never exposed, borrowed or pinned while stored.
+struct RetirementGuard<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for RetirementGuard<F> {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
+#[repr(C)]
+struct OwnedReleased<T, F> {
+    ref_cnt: AtomicUsize,
+    owner: ManuallyDrop<T>,
+    release: ManuallyDrop<F>,
+}
+
+impl<T, F: FnOnce()> OwnedReleased<T, F> {
+    const VTABLE: Vtable = Vtable {
+        clone: released_clone::<T, F>,
+        into_vec: released_to_vec::<T, F>,
+        into_mut: released_to_mut::<T, F>,
+        is_unique: owned_is_unique,
+        drop: released_drop::<T, F>,
+    };
+}
+
+unsafe fn released_clone<T, F: FnOnce()>(
+    data: &AtomicPtr<()>,
+    ptr: *const u8,
+    len: usize,
+) -> Bytes {
+    let owned = data.load(Ordering::Relaxed);
+    // Finish the potentially panicking model atomic constructor while the
+    // source handle alone retains its original reference.
+    let data = AtomicPtr::new(owned);
+    let old_cnt = (*owned.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed);
+    if old_cnt > usize::MAX >> 1 {
+        crate::abort();
+    }
+    Bytes {
+        ptr,
+        len,
+        data,
+        vtable: &OwnedReleased::<T, F>::VTABLE,
+    }
+}
+
+unsafe fn released_to_vec<T, F: FnOnce()>(owned: *mut (), ptr: *const u8, len: usize) -> Vec<u8> {
+    // The caller consumed its Bytes handle. Reestablish its one cleanup token
+    // before copying, without allocating or constructing another atomic.
+    let retirement = RetirementGuard(Some(|| released_drop_impl::<T, F>(owned)));
+    let vec = slice::from_raw_parts(ptr, len).to_vec();
+    drop(retirement);
+    vec
+}
+
+unsafe fn released_to_mut<T, F: FnOnce()>(owned: *mut (), ptr: *const u8, len: usize) -> BytesMut {
+    BytesMut::from_vec(released_to_vec::<T, F>(owned, ptr, len))
+}
+
+unsafe fn released_drop_impl<T, F: FnOnce()>(owned: *mut ()) {
+    {
+        let ref_cnt = &*owned.cast::<AtomicUsize>();
+        let old_cnt = ref_cnt.fetch_sub(1, Ordering::Release);
+        debug_assert!(
+            old_cnt > 0 && old_cnt <= usize::MAX >> 1,
+            "expected non-zero refcount and no underflow"
+        );
+        if old_cnt != 1 {
+            return;
+        }
+        ref_cnt.load(Ordering::Acquire);
+    }
+    let owned = owned.cast::<OwnedReleased<T, F>>();
+    // SAFETY: the last reference has sole ownership. Establish the outer
+    // callback guard before reconstructing the inner Box, so even T::drop's
+    // unwind deallocates that Box before invoking the callback exactly once.
+    let retirement = RetirementGuard(Some(ManuallyDrop::take(&mut (*owned).release)));
+    {
+        let mut allocation = Box::from_raw(owned);
+        ManuallyDrop::drop(&mut allocation.owner);
+    }
+    drop(retirement);
+}
+
+unsafe fn released_drop<T, F: FnOnce()>(data: *mut (), _ptr: *const u8, _len: usize) {
+    released_drop_impl::<T, F>(data);
+}
+
 // ===== impl PromotableVtable =====
 
 static PROMOTABLE_EVEN_VTABLE: Vtable = Vtable {
@@ -1624,34 +1777,3 @@ fn _split_to_must_use() {}
 fn _split_off_must_use() {}
 
 // fuzz tests
-#[cfg(all(test, loom))]
-mod fuzz {
-    use loom::sync::Arc;
-    use loom::thread;
-
-    use super::Bytes;
-    #[test]
-    fn bytes_cloning_vec() {
-        loom::model(|| {
-            let a = Bytes::from(b"abcdefgh".to_vec());
-            let addr = a.as_ptr() as usize;
-
-            // test the Bytes::clone is Sync by putting it in an Arc
-            let a1 = Arc::new(a);
-            let a2 = a1.clone();
-
-            let t1 = thread::spawn(move || {
-                let b: Bytes = (*a1).clone();
-                assert_eq!(b.as_ptr() as usize, addr);
-            });
-
-            let t2 = thread::spawn(move || {
-                let b: Bytes = (*a2).clone();
-                assert_eq!(b.as_ptr() as usize, addr);
-            });
-
-            t1.join().unwrap();
-            t2.join().unwrap();
-        });
-    }
-}
