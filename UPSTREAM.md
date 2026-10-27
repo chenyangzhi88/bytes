@@ -24,3 +24,14 @@ explicit release/commit into a maintenance branch, review actual source changes,
 run owning/upstream tests and affected kernel regressions, then update the kernel
 gitlink. Publish the required maintenance commit before sharing that gitlink.
 Do not reset away local ownership/release fixes or silently follow upstream HEAD.
+
+## Complete retained allocation capacity
+
+`BytesMut::backing_capacity()` reports the capacity of the retained Vec,
+including prefixes and suffixes outside the current view. The Vec representation
+uses its stored offset plus visible capacity; the shared representation reads the
+existing immutable Vec metadata. The method is read-only and adds no storage or
+allocation. `capacity()` retains its original writable-view semantics. Private
+regressions cover split, advance, clear, reclaim, shared relocation and retained
+aliases. This allows bounded consumers to reason about real retention without
+tracking pointer identities or historical allocation estimates.

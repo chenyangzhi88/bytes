@@ -226,6 +226,23 @@ impl BytesMut {
         self.cap
     }
 
+    /// Returns the capacity of the complete allocation retained by this view.
+    ///
+    /// Unlike [`capacity`](Self::capacity), this includes storage before and
+    /// after the current view, including storage retained by split handles.
+    /// It does not include the reference-counted allocation's control data.
+    /// Use `capacity()` to determine the writable capacity of this view.
+    #[inline]
+    pub fn backing_capacity(&self) -> usize {
+        if self.kind() == KIND_VEC {
+            self.cap + unsafe { self.get_vec_pos() }
+        } else {
+            // This live handle keeps Shared alive. Its Vec metadata cannot be
+            // changed by another handle: reallocation requires unique ownership.
+            unsafe { (*self.data).vec.capacity() }
+        }
+    }
+
     /// Converts `self` into an immutable `Bytes`.
     ///
     /// The conversion is zero cost and is used to indicate that the slice
